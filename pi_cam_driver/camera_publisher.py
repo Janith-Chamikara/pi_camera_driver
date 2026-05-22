@@ -6,29 +6,27 @@ import time
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
+from rclpy.qos import qos_profile_sensor_data
 
 
 class CameraPublisher(Node):
     def __init__(self):
-        # Name the node (this can be overridden by a launch file later)
         super().__init__('camera_publisher_node')
 
-        # 1. Declare Parameters
-        # This allows us to use the same script for the Left and Right Pi
-        # just by passing different names when we launch it.
-        self.declare_parameter('topic_name', 'camera/image/compressed')
+        self.declare_parameter('topic_name', '/left/camera/image/compressed')
         self.declare_parameter('camera_id', 0)
         self.declare_parameter('framerate', 30.0)
+
+        self.declare_parameter('jpeg_quality', 30)
 
         topic_name = self.get_parameter('topic_name').value
         camera_id = self.get_parameter('camera_id').value
         fps = self.get_parameter('framerate').value
+        self.jpeg_quality = self.get_parameter('jpeg_quality').value
 
-        # 2. Setup Publisher
         self.publisher_ = self.create_publisher(
-            CompressedImage, topic_name, 10)
+            CompressedImage, topic_name, qos_profile_sensor_data)
 
-        # 3. Initialize Camera via rpicam-vid / libcamera-vid
         self.proc = None
         self._latest_jpeg = None
         self._jpeg_lock = threading.Lock()
@@ -38,15 +36,12 @@ class CameraPublisher(Node):
             self.get_logger().error(f"Failed to open camera {camera_id}")
             return
 
-        # 4. Set up the publishing loop
         timer_period = 1.0 / fps
         self.timer = self.create_timer(timer_period, self.timer_callback)
-        self.get_logger().info(f"Publishing to {topic_name} at {fps} FPS")
+        self.get_logger().info(
+            f"Publishing to {topic_name} at {fps} FPS (QoS: Best Effort, Quality: {self.jpeg_quality})")
 
     def _try_libcamera(self, camera_id, fps):
-        """Start rpicam-vid (or legacy libcamera-vid) as a subprocess, outputting MJPEG to stdout."""
-
-        # Prefer rpicam-vid (new name), fall back to libcamera-vid (legacy)
         cmd = None
         if shutil.which('rpicam-vid'):
             cmd = 'rpicam-vid'
@@ -65,6 +60,7 @@ class CameraPublisher(Node):
                     '--width', '640', '--height', '480',
                     '--framerate', str(int(fps)),
                     '--codec', 'mjpeg',
+                    '-q', str(self.jpeg_quality),
                     '--nopreview',
                     '-o', '-'
                 ],
@@ -72,13 +68,11 @@ class CameraPublisher(Node):
                 stderr=subprocess.PIPE,
                 bufsize=0
             )
-            # Start a background thread to read JPEG frames from stdout
             self._reader_thread = threading.Thread(
                 target=self._read_mjpeg_stream, daemon=True
             )
             self._reader_thread.start()
 
-            # Wait briefly and check the process didn't crash
             time.sleep(2.0)
             if self.proc.poll() is not None:
                 stderr_out = self.proc.stderr.read().decode(errors='replace')
@@ -93,7 +87,6 @@ class CameraPublisher(Node):
             return False
 
     def _read_mjpeg_stream(self):
-        """Read MJPEG stream from libcamera-vid stdout, extract JPEG frames."""
         buf = bytearray()
         stdout = self.proc.stdout
         while self.proc and self.proc.poll() is None:
@@ -101,7 +94,6 @@ class CameraPublisher(Node):
             if not chunk:
                 break
             buf.extend(chunk)
-            # Look for JPEG boundaries: SOI=0xFFD8, EOI=0xFFD9
             while True:
                 start = buf.find(b'\xff\xd8')
                 if start == -1:
@@ -109,11 +101,9 @@ class CameraPublisher(Node):
                     break
                 end = buf.find(b'\xff\xd9', start + 2)
                 if end == -1:
-                    # Trim everything before the start marker
                     if start > 0:
                         del buf[:start]
                     break
-                # Complete JPEG found
                 jpeg_data = bytes(buf[start:end + 2])
                 with self._jpeg_lock:
                     self._latest_jpeg = jpeg_data
@@ -142,7 +132,6 @@ class CameraPublisher(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = CameraPublisher()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
